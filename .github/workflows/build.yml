@@ -1,0 +1,84 @@
+# Upstream golang.org/x/net has no GitHub Actions CI (it is developed on
+# Gerrit at go.googlesource.com/net), so this workflow is written from
+# scratch. It mirrors what the project itself does: build every package and
+# run the full `go test ./...` suite with the Go release declared by go.mod.
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated Go test names to run instead of the full suite"
+        required: false
+        default: ""
+
+# Dependency versions are exactly pinned by go.mod and their hashes by go.sum,
+# so the public proxy resolves the same bytes the release did; Seal's registry
+# time machine does not resolve from GitHub-hosted runners.
+env:
+  GOTOOLCHAIN: local
+  MODULE_PATH: golang.org/x/net
+  MODULE_VERSION: v0.45.0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          check-latest: false
+          cache: false
+
+      - name: Go version
+        run: go version
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            # Steps run under `bash -e` without pipefail, so without this the
+            # step would exit with tee's status and a failing `go test` would
+            # report success.
+            set -o pipefail
+            go test -v -run "^($(echo "${{ inputs.test-filter }}" | tr ' ' '|'))$" ./... 2>&1 | tee /tmp/scoped.log
+            for t in ${{ inputs.test-filter }}; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" /tmp/scoped.log || exit 1
+            done
+          else
+            go test ./...
+          fi
+
+      - name: Stage the module tree
+        run: |
+          set -euo pipefail
+          rm -rf "${RUNNER_TEMP}/modsrc" "${RUNNER_TEMP}/out"
+          mkdir -p "${RUNNER_TEMP}/modsrc" "${RUNNER_TEMP}/out"
+          # The published module zip is upstream's tree; .github/ is Seal's
+          # addition (upstream ships none), so it is staged out before packing.
+          tar -c --exclude=./.git --exclude=./.github . | tar -x -C "${RUNNER_TEMP}/modsrc"
+
+      - name: Build module zip
+        working-directory: .github/modzip
+        run: |
+          set -euo pipefail
+          go mod init seal.local/modzip
+          # Pinned: x/mod v0.29.0 and later declare `go >= 1.25`, which the Go
+          # release this module targets (go.mod says 1.24.0) cannot build.
+          go get golang.org/x/mod@v0.28.0
+          go run . "$MODULE_PATH" "$MODULE_VERSION" "${RUNNER_TEMP}/modsrc" "${RUNNER_TEMP}/out/${MODULE_VERSION}.zip"
+          unzip -l "${RUNNER_TEMP}/out/${MODULE_VERSION}.zip" | tail -n 5
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.45.0.zip
+          if-no-files-found: error
